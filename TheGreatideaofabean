@@ -1,0 +1,144 @@
+import cv2
+import glob
+import os
+import time
+import math
+import torch
+from ultralytics import YOLO
+from collections import defaultdict
+
+DEVICE = 0 if torch.cuda.is_available() else 'cpu'
+print(f"Loading YOLOv8 model on {DEVICE}...")
+
+model = YOLO('yolov8n.pt')
+
+VIDEO_FOLDER = "."
+video_files = glob.glob(os.path.join(VIDEO_FOLDER, "*.mp4"))
+
+VEHICLE_CLASSES = [2, 3, 5, 7]
+CONGESTION_THRESHOLD = 10
+
+
+MOVEMENT_THRESHOLD = 20
+HISTORY_LENGTH = 30
+
+
+car_history = defaultdict(list)
+
+
+def calculate_distance(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+
+def get_current_time():
+    return time.strftime("%H:%M:%S")
+
+
+
+for video_path in video_files:
+    filename = os.path.basename(video_path)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened(): continue
+
+
+    ret, first_frame = cap.read()
+    if not ret: continue
+
+
+    first_frame = cv2.resize(first_frame, (1280, 720))
+
+    print(f"[ACTION] Draw ROI for {filename}...")
+    selection = cv2.selectROI("Select ROI", first_frame, False)
+    cv2.destroyWindow("Select ROI")
+    if selection == (0, 0, 0, 0): continue
+
+    roi_x1, roi_y1, roi_w, roi_h = map(int, selection)
+    roi_x2, roi_y2 = roi_x1 + roi_w, roi_y1 + roi_h
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+
+    car_history.clear()
+
+
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+
+        frame_count += 1
+
+
+        frame = cv2.resize(frame, (1280, 720))
+
+
+        results = model.track(frame, persist=True, verbose=False, device=DEVICE)
+
+        vehicles_in_roi = 0
+
+        if results[0].boxes.id is not None:
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+            boxes = results[0].boxes.xyxy.cpu()
+            classes = results[0].boxes.cls.int().cpu().tolist()
+
+            for box, track_id, cls in zip(boxes, track_ids, classes):
+                if cls in VEHICLE_CLASSES:
+                    x1, y1, x2, y2 = map(int, box)
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+
+                    car_history[track_id].append((cx, cy))
+                    if len(car_history[track_id]) > HISTORY_LENGTH:
+                        car_history[track_id].pop(0)
+
+
+                    is_inside_roi = (roi_x1 < cx < roi_x2) and (roi_y1 < cy < roi_y2)
+                    is_stopped = False
+
+                    if len(car_history[track_id]) >= HISTORY_LENGTH:
+                        prev_pos = car_history[track_id][0]
+                        curr_pos = car_history[track_id][-1]
+                        dist = calculate_distance(prev_pos, curr_pos)
+
+                        if dist < MOVEMENT_THRESHOLD:
+                            is_stopped = True
+
+
+                    color = (0, 255, 0)
+                    label = f"ID:{track_id}"
+
+                    if is_inside_roi:
+                        vehicles_in_roi += 1
+                        if is_stopped:
+                            color = (0, 165, 255)  #
+                            label = f"STOPPED"
+                        else:
+                            color = (0, 0, 255)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+
+        cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 0, 0), 2)
+        cv2.putText(frame, f"Count: {vehicles_in_roi}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+
+        status_text = "Free Flow"
+        if vehicles_in_roi > CONGESTION_THRESHOLD:
+            status_text = "CONGESTION!"
+
+
+        if frame_count % 30 == 0:
+            print(
+                f"[{get_current_time()}] {filename} | Frame: {frame_count} | Cars: {vehicles_in_roi} | Status: {status_text}")
+
+        cv2.imshow(f"Tracking: {filename}", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    cap.release()
+    cv2.destroyAllWindows()
